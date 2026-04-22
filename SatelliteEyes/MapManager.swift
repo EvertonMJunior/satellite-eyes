@@ -28,6 +28,7 @@ class MapManager: NSObject, CLLocationManagerDelegate {
     private var hasStarted = false
     private var currentRandomLocation: LocationStore.NamedLocation?
     private var rotationTimer: Timer?
+    private var lastPrefetchKey: String?
 
     private var useCurrentLocation: Bool {
         UserDefaults.standard.bool(forKey: "useCurrentLocation")
@@ -39,6 +40,15 @@ class MapManager: NSObject, CLLocationManagerDelegate {
 
     private var rotationIntervalSeconds: TimeInterval {
         max(3600, TimeInterval(UserDefaults.standard.integer(forKey: "rotationIntervalSeconds")))
+    }
+
+    private var prefetchCacheEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "prefetchCacheEnabled")
+    }
+
+    private var prefetchRadiusMeters: Double {
+        let radius = UserDefaults.standard.integer(forKey: "prefetchRadiusMeters")
+        return Double(min(max(radius, 100), 20_000))
     }
 
     // MARK: - Init
@@ -74,6 +84,8 @@ class MapManager: NSObject, CLLocationManagerDelegate {
         UserDefaults.standard.addObserver(self, forKeyPath: "useCurrentLocation", options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: "randomLocationCategory", options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: "rotationIntervalSeconds", options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: "prefetchCacheEnabled", options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: "prefetchRadiusMeters", options: .new, context: nil)
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(spaceChanged),
@@ -93,6 +105,8 @@ class MapManager: NSObject, CLLocationManagerDelegate {
         UserDefaults.standard.removeObserver(self, forKeyPath: "useCurrentLocation")
         UserDefaults.standard.removeObserver(self, forKeyPath: "randomLocationCategory")
         UserDefaults.standard.removeObserver(self, forKeyPath: "rotationIntervalSeconds")
+        UserDefaults.standard.removeObserver(self, forKeyPath: "prefetchCacheEnabled")
+        UserDefaults.standard.removeObserver(self, forKeyPath: "prefetchRadiusMeters")
         rotationTimer?.invalidate()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
@@ -130,6 +144,8 @@ class MapManager: NSObject, CLLocationManagerDelegate {
     }
 
     func updateMap(to coordinate: CLLocationCoordinate2D, force: Bool) {
+        triggerPrefetchIfNeeded(for: coordinate)
+
         for screen in NSScreen.screens {
             updateQueue.async { [self] in
                 NotificationCenter.default.post(name: Self.startedLoadNotification, object: nil)
@@ -431,5 +447,31 @@ class MapManager: NSObject, CLLocationManagerDelegate {
               screenIsRetina(screen) else { return false }
         let maxZoom = (selectedMapType["maxZoom"] as? NSNumber)?.intValue ?? Int(UInt16.max)
         return Int(zoomLevel) + 1 <= maxZoom
+    }
+
+    private func triggerPrefetchIfNeeded(for coordinate: CLLocationCoordinate2D) {
+        guard useCurrentLocation, prefetchCacheEnabled else { return }
+        guard let source = selectedMapType["source"] as? String, !source.isEmpty else { return }
+
+        let zoom = zoomLevel
+        let centerPoint = MapTile.coordinateToPoint(coordinate, zoomLevel: zoom)
+        let key = "\(source)_\(zoom)_\(Int(prefetchRadiusMeters))_\(Int(centerPoint.x))_\(Int(centerPoint.y))"
+
+        guard key != lastPrefetchKey else { return }
+        lastPrefetchKey = key
+
+        let radius = prefetchRadiusMeters
+        Task.detached {
+            do {
+                try await MapImage.prefetchTiles(
+                    around: coordinate,
+                    source: source,
+                    zoomLevel: zoom,
+                    radiusMeters: radius
+                )
+            } catch {
+                log.error("Error pre-fetching nearby tiles: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 }

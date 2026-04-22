@@ -299,5 +299,9 @@
 	<string></string>
 	<key>rotationIntervalSeconds</key>
 	<integer>86400</integer>
+	<key>prefetchCacheEnabled</key>
+	<false/>
+	<key>prefetchRadiusMeters</key>
+	<integer>1000</integer>
 </dict>
 </plist>
