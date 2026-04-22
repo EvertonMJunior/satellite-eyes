@@ -6,6 +6,7 @@ import os
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
 
 private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
+private let maxPrefetchTileCount = 2500
 
 enum TileFetchError: LocalizedError {
     case invalidContentType(url: URL, contentType: String?)
@@ -97,8 +98,8 @@ class MapImage {
         guard radiusMeters > 0 else { return }
 
         let latDelta = radiusMeters / 111_320.0
-        let cosLat = max(0.01, abs(cos(coordinate.latitude * .pi / 180.0)))
-        let lonDelta = radiusMeters / (111_320.0 * cosLat)
+        let cosLat = max(0.2, abs(cos(coordinate.latitude * .pi / 180.0)))
+        let lonDelta = min(radiusMeters / (111_320.0 * cosLat), 10.0)
 
         let topLatitude = min(85.0511, coordinate.latitude + latDelta)
         let bottomLatitude = max(-85.0511, coordinate.latitude - latDelta)
@@ -125,18 +126,21 @@ class MapImage {
 
         let maxTileIndex = Int(pow(2.0, Double(zoomLevel))) - 1
         let wrappedRange = maxTileIndex + 1
+        let clampedMinY = max(0, minY)
+        let clampedMaxY = min(maxTileIndex, maxY)
+        guard clampedMinY <= clampedMaxY else { return }
 
         var tiles: [MapTile] = []
-        tiles.reserveCapacity(max(0, (maxX - minX + 1) * (maxY - minY + 1)))
+        tiles.reserveCapacity(max(0, (maxX - minX + 1) * max(0, clampedMaxY - clampedMinY + 1)))
 
-        for y in minY...maxY where y >= 0 && y <= maxTileIndex {
+        for y in clampedMinY...clampedMaxY {
             for x in minX...maxX {
                 let wrappedX = ((x % wrappedRange) + wrappedRange) % wrappedRange
                 tiles.append(MapTile(source: source, x: UInt(wrappedX), y: UInt(y), z: zoomLevel))
             }
         }
 
-        if tiles.count > 2500 {
+        if tiles.count > maxPrefetchTileCount {
             log.debug("Skipping prefetch because tile count is too large: \(tiles.count, privacy: .public)")
             return
         }
@@ -144,12 +148,8 @@ class MapImage {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for tile in tiles {
                 group.addTask {
-                    if let cachedData = Self.cachedTileData(for: tile) {
-                        tile.imageData = cachedData
-                        if tile.newImageRef() != nil {
-                            return
-                        }
-                        Self.removeCachedTile(for: tile)
+                    if Self.loadCachedTileIfValid(for: tile) {
+                        return
                     }
 
                     let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
@@ -199,12 +199,8 @@ class MapImage {
             for row in tiles {
                 for tile in row {
                     group.addTask {
-                        if !skipCache, let cachedData = Self.cachedTileData(for: tile) {
-                            tile.imageData = cachedData
-                            if tile.newImageRef() != nil {
-                                return
-                            }
-                            Self.removeCachedTile(for: tile)
+                        if !skipCache, Self.loadCachedTileIfValid(for: tile) {
+                            return
                         }
 
                         let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
@@ -250,6 +246,17 @@ class MapImage {
         let fileURL = cacheFileURL(for: tile)
         guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return nil }
         return data
+    }
+
+    private static func loadCachedTileIfValid(for tile: MapTile) -> Bool {
+        guard let cachedData = cachedTileData(for: tile) else { return false }
+        tile.imageData = cachedData
+        if tile.newImageRef() != nil {
+            return true
+        }
+        removeCachedTile(for: tile)
+        tile.imageData = nil
+        return false
     }
 
     private static func storeTileData(_ data: Data, for tile: MapTile) {
