@@ -42,6 +42,10 @@ class MapTile {
 
     func newImageRef() -> CGImage? {
         guard let data = imageData else { return nil }
+        return Self.imageRef(from: data)
+    }
+
+    static func imageRef(from data: Data) -> CGImage? {
         let cfData = data as CFData
         guard let provider = CGDataProvider(data: cfData) else { return nil }
         return CGImage(

@@ -5,6 +5,7 @@ import os
 
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapManager")
 private let baseTileSize: CGFloat = 256
+private let prefetchCoordinateRoundingPrecision = 1000.0
 
 class MapManager: NSObject, CLLocationManagerDelegate {
 
@@ -454,8 +455,8 @@ class MapManager: NSObject, CLLocationManagerDelegate {
         guard let source = selectedMapType["source"] as? String, !source.isEmpty else { return }
 
         let zoom = zoomLevel
-        let roundedLatitude = (coordinate.latitude * 1000).rounded() / 1000
-        let roundedLongitude = (coordinate.longitude * 1000).rounded() / 1000
+        let roundedLatitude = (coordinate.latitude * prefetchCoordinateRoundingPrecision).rounded() / prefetchCoordinateRoundingPrecision
+        let roundedLongitude = (coordinate.longitude * prefetchCoordinateRoundingPrecision).rounded() / prefetchCoordinateRoundingPrecision
         let key = "\(source)_\(zoom)_\(Int(prefetchRadiusMeters))_\(roundedLatitude)_\(roundedLongitude)"
 
         guard key != lastPrefetchKey else { return }

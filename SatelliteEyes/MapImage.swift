@@ -9,6 +9,7 @@ private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
 private let metersPerDegreeLatitude = 111_320.0
 private let minimumPrefetchLatitudeCosine = 0.2
 private let maximumPrefetchLongitudeDeltaDegrees = 10.0
+private let webMercatorMaxLatitude = 85.0511
 private let maxPrefetchTileCount = 2500
 
 enum TileFetchError: LocalizedError {
@@ -107,8 +108,8 @@ class MapImage {
             maximumPrefetchLongitudeDeltaDegrees
         )
 
-        let topLatitude = min(85.0511, coordinate.latitude + latDelta)
-        let bottomLatitude = max(-85.0511, coordinate.latitude - latDelta)
+        let topLatitude = min(webMercatorMaxLatitude, coordinate.latitude + latDelta)
+        let bottomLatitude = max(-webMercatorMaxLatitude, coordinate.latitude - latDelta)
         let leftLongitude = max(-180.0, coordinate.longitude - lonDelta)
         let rightLongitude = min(180.0, coordinate.longitude + lonDelta)
 
@@ -256,13 +257,12 @@ class MapImage {
 
     private static func loadCachedTileIfValid(for tile: MapTile) -> Bool {
         guard let cachedData = cachedTileData(for: tile) else { return false }
-        tile.imageData = cachedData
-        if tile.newImageRef() != nil {
-            return true
+        guard MapTile.imageRef(from: cachedData) != nil else {
+            removeCachedTile(for: tile)
+            return false
         }
-        removeCachedTile(for: tile)
-        tile.imageData = nil
-        return false
+        tile.imageData = cachedData
+        return true
     }
 
     private static func storeTileData(_ data: Data, for tile: MapTile) {
