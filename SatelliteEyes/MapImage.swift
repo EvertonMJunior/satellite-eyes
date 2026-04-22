@@ -10,6 +10,7 @@ private let metersPerDegreeLatitude = 111_320.0
 private let minimumPrefetchLatitudeCosine = 0.2
 private let maximumPrefetchLongitudeDeltaDegrees = 10.0
 private let webMercatorMaxLatitude = 85.0511
+// Caps prefetch scope so one update doesn't enqueue excessive downloads.
 private let maxPrefetchTileCount = 2500
 
 enum TileFetchError: LocalizedError {
@@ -154,7 +155,7 @@ class MapImage {
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             for tile in tiles {
-                if Self.loadCachedTileIfValid(for: tile) {
+                if !Self.shouldFetchTileFromNetwork(tile, skipCache: false) {
                     continue
                 }
 
@@ -205,7 +206,7 @@ class MapImage {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for row in tiles {
                 for tile in row {
-                    if !skipCache, Self.loadCachedTileIfValid(for: tile) {
+                    if !Self.shouldFetchTileFromNetwork(tile, skipCache: skipCache) {
                         continue
                     }
 
@@ -265,6 +266,11 @@ class MapImage {
         return true
     }
 
+    private static func shouldFetchTileFromNetwork(_ tile: MapTile, skipCache: Bool) -> Bool {
+        guard !skipCache else { return true }
+        return !loadCachedTileIfValid(for: tile)
+    }
+
     private static func storeTileData(_ data: Data, for tile: MapTile) {
         let fileURL = cacheFileURL(for: tile)
         do {
@@ -279,7 +285,9 @@ class MapImage {
         do {
             try FileManager.default.removeItem(at: fileURL)
         } catch {
-            guard (error as NSError).code != NSFileReadNoSuchFileError else { return }
+            if let cocoaError = error as? CocoaError, cocoaError.code == .fileNoSuchFile {
+                return
+            }
             log.error("Failed to remove tile cache file: \(error.localizedDescription, privacy: .public)")
         }
     }

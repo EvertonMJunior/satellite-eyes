@@ -455,8 +455,8 @@ class MapManager: NSObject, CLLocationManagerDelegate {
         guard let source = selectedMapType["source"] as? String, !source.isEmpty else { return }
 
         let zoom = zoomLevel
-        let roundedLatitude = (coordinate.latitude * prefetchCoordinateRoundingPrecision).rounded() / prefetchCoordinateRoundingPrecision
-        let roundedLongitude = (coordinate.longitude * prefetchCoordinateRoundingPrecision).rounded() / prefetchCoordinateRoundingPrecision
+        let roundedLatitude = roundedPrefetchCoordinateValue(coordinate.latitude)
+        let roundedLongitude = roundedPrefetchCoordinateValue(coordinate.longitude)
         let key = "\(source)_\(zoom)_\(Int(prefetchRadiusMeters))_\(roundedLatitude)_\(roundedLongitude)"
 
         guard key != lastPrefetchKey else { return }
@@ -475,5 +475,9 @@ class MapManager: NSObject, CLLocationManagerDelegate {
                 log.error("Error pre-fetching nearby tiles: \(error.localizedDescription, privacy: .public)")
             }
         }
+    }
+
+    private func roundedPrefetchCoordinateValue(_ value: CLLocationDegrees) -> CLLocationDegrees {
+        (value * prefetchCoordinateRoundingPrecision).rounded() / prefetchCoordinateRoundingPrecision
     }
 }
