@@ -153,11 +153,11 @@ class MapImage {
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             for tile in tiles {
-                group.addTask {
-                    if Self.loadCachedTileIfValid(for: tile) {
-                        return
-                    }
+                if Self.loadCachedTileIfValid(for: tile) {
+                    continue
+                }
 
+                group.addTask {
                     let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
                     let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
                     let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
@@ -204,11 +204,11 @@ class MapImage {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for row in tiles {
                 for tile in row {
-                    group.addTask {
-                        if !skipCache, Self.loadCachedTileIfValid(for: tile) {
-                            return
-                        }
+                    if !skipCache, Self.loadCachedTileIfValid(for: tile) {
+                        continue
+                    }
 
+                    group.addTask {
                         let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
                         let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
                         let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
@@ -279,7 +279,7 @@ class MapImage {
         do {
             try FileManager.default.removeItem(at: fileURL)
         } catch {
-            guard (error as NSError).code != NSFileNoSuchFileError else { return }
+            guard (error as NSError).code != NSFileReadNoSuchFileError else { return }
             log.error("Failed to remove tile cache file: \(error.localizedDescription, privacy: .public)")
         }
     }

@@ -454,8 +454,9 @@ class MapManager: NSObject, CLLocationManagerDelegate {
         guard let source = selectedMapType["source"] as? String, !source.isEmpty else { return }
 
         let zoom = zoomLevel
-        let centerPoint = MapTile.coordinateToPoint(coordinate, zoomLevel: zoom)
-        let key = "\(source)_\(zoom)_\(Int(prefetchRadiusMeters))_\(Int(centerPoint.x))_\(Int(centerPoint.y))"
+        let roundedLatitude = (coordinate.latitude * 1000).rounded() / 1000
+        let roundedLongitude = (coordinate.longitude * 1000).rounded() / 1000
+        let key = "\(source)_\(zoom)_\(Int(prefetchRadiusMeters))_\(roundedLatitude)_\(roundedLongitude)"
 
         guard key != lastPrefetchKey else { return }
         lastPrefetchKey = key
