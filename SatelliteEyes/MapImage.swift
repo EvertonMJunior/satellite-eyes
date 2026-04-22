@@ -6,6 +6,9 @@ import os
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
 
 private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
+private let metersPerDegreeLatitude = 111_320.0
+private let minimumPrefetchLatitudeCosine = 0.2
+private let maximumPrefetchLongitudeDeltaDegrees = 10.0
 private let maxPrefetchTileCount = 2500
 
 enum TileFetchError: LocalizedError {
@@ -97,9 +100,12 @@ class MapImage {
                               radiusMeters: Double) async throws {
         guard radiusMeters > 0 else { return }
 
-        let latDelta = radiusMeters / 111_320.0
-        let cosLat = max(0.2, abs(cos(coordinate.latitude * .pi / 180.0)))
-        let lonDelta = min(radiusMeters / (111_320.0 * cosLat), 10.0)
+        let latDelta = radiusMeters / metersPerDegreeLatitude
+        let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
+        let lonDelta = min(
+            radiusMeters / (metersPerDegreeLatitude * cosLat),
+            maximumPrefetchLongitudeDeltaDegrees
+        )
 
         let topLatitude = min(85.0511, coordinate.latitude + latDelta)
         let bottomLatitude = max(-85.0511, coordinate.latitude - latDelta)
@@ -255,7 +261,6 @@ class MapImage {
             return true
         }
         removeCachedTile(for: tile)
-        tile.imageData = nil
         return false
     }
 
