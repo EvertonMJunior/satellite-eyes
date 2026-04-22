@@ -137,7 +137,7 @@ class MapImage {
         guard clampedMinY <= clampedMaxY else { return }
 
         var tiles: [MapTile] = []
-        tiles.reserveCapacity(max(0, (maxX - minX + 1) * max(0, clampedMaxY - clampedMinY + 1)))
+        tiles.reserveCapacity(max(0, (maxX - minX + 1) * (clampedMaxY - clampedMinY + 1)))
 
         for y in clampedMinY...clampedMaxY {
             for x in minX...maxX {
@@ -261,17 +261,27 @@ class MapImage {
             return true
         }
         removeCachedTile(for: tile)
+        tile.imageData = nil
         return false
     }
 
     private static func storeTileData(_ data: Data, for tile: MapTile) {
         let fileURL = cacheFileURL(for: tile)
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            log.error("Failed to write tile cache file: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private static func removeCachedTile(for tile: MapTile) {
         let fileURL = cacheFileURL(for: tile)
-        try? FileManager.default.removeItem(at: fileURL)
+        do {
+            try FileManager.default.removeItem(at: fileURL)
+        } catch {
+            guard (error as NSError).code != NSFileNoSuchFileError else { return }
+            log.error("Failed to remove tile cache file: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func writeImageData() -> URL {
