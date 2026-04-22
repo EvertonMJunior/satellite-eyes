@@ -5,6 +5,7 @@ import os
 
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapManager")
 private let baseTileSize: CGFloat = 256
+// Round coordinates to 1/1000° buckets (~111m at equator) for prefetch deduplication.
 private let prefetchCoordinateRoundingPrecision = 1000.0
 
 class MapManager: NSObject, CLLocationManagerDelegate {

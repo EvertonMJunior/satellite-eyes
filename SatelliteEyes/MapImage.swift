@@ -6,7 +6,7 @@ import os
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
 
 private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
-private let metersPerDegreeLatitude = 111_320.0
+private let approximateMetersPerDegreeLatitude = 111_320.0
 private let minimumPrefetchLatitudeCosine = 0.2
 private let maximumPrefetchLongitudeDeltaDegrees = 10.0
 private let webMercatorMaxLatitude = 85.0511
@@ -102,10 +102,10 @@ class MapImage {
                               radiusMeters: Double) async throws {
         guard radiusMeters > 0 else { return }
 
-        let latDelta = radiusMeters / metersPerDegreeLatitude
+        let latDelta = radiusMeters / approximateMetersPerDegreeLatitude
         let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
         let lonDelta = min(
-            radiusMeters / (metersPerDegreeLatitude * cosLat),
+            radiusMeters / (approximateMetersPerDegreeLatitude * cosLat),
             maximumPrefetchLongitudeDeltaDegrees
         )
 
@@ -137,9 +137,10 @@ class MapImage {
         let clampedMinY = max(0, minY)
         let clampedMaxY = min(maxTileIndex, maxY)
         guard clampedMinY <= clampedMaxY else { return }
+        let estimatedTileCount = max(0, (maxX - minX + 1) * (clampedMaxY - clampedMinY + 1))
 
         var tiles: [MapTile] = []
-        tiles.reserveCapacity(max(0, (maxX - minX + 1) * (clampedMaxY - clampedMinY + 1)))
+        tiles.reserveCapacity(estimatedTileCount)
 
         for y in clampedMinY...clampedMaxY {
             for x in minX...maxX {
@@ -166,11 +167,7 @@ class MapImage {
                     if let mimeType, !validTileContentTypes.contains(mimeType) {
                         throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
                     }
-                    tile.imageData = data
-                    guard tile.newImageRef() != nil else {
-                        throw TileFetchError.undecodableImage(url: tile.url)
-                    }
-                    Self.storeTileData(data, for: tile)
+                    try Self.validateAndStoreTileData(data, for: tile)
                 }
             }
             try await group.waitForAll()
@@ -217,11 +214,7 @@ class MapImage {
                         if let mimeType, !validTileContentTypes.contains(mimeType) {
                             throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
                         }
-                        tile.imageData = data
-                        guard tile.newImageRef() != nil else {
-                            throw TileFetchError.undecodableImage(url: tile.url)
-                        }
-                        Self.storeTileData(data, for: tile)
+                        try Self.validateAndStoreTileData(data, for: tile)
                     }
                 }
             }
@@ -269,6 +262,14 @@ class MapImage {
     private static func shouldFetchTileFromNetwork(_ tile: MapTile, skipCache: Bool) -> Bool {
         guard !skipCache else { return true }
         return !loadCachedTileIfValid(for: tile)
+    }
+
+    private static func validateAndStoreTileData(_ data: Data, for tile: MapTile) throws {
+        tile.imageData = data
+        guard tile.newImageRef() != nil else {
+            throw TileFetchError.undecodableImage(url: tile.url)
+        }
+        storeTileData(data, for: tile)
     }
 
     private static func storeTileData(_ data: Data, for tile: MapTile) {
