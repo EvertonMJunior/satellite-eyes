@@ -1,10 +1,17 @@
 import Cocoa
 import CoreImage
+import CoreLocation
 import os
 
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
 
 private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
+private let approximateMetersPerDegreeLatitude = 111_320.0
+private let minimumPrefetchLatitudeCosine = 0.2
+private let maximumPrefetchLongitudeDeltaDegrees = 10.0
+private let webMercatorMaxLatitude = 85.0511
+// Caps prefetch scope so one update doesn't enqueue excessive downloads.
+private let maxPrefetchTileCount = 2500
 
 enum TileFetchError: LocalizedError {
     case invalidContentType(url: URL, contentType: String?)
@@ -36,6 +43,12 @@ class MapImage {
         let config = URLSessionConfiguration.default
         config.httpMaximumConnectionsPerHost = 4
         return URLSession(configuration: config)
+    }()
+
+    private static let tileCacheDirectoryURL: URL = {
+        let directory = URL(fileURLWithPath: FileManager.default.pathForPrivateFile("tiles"), isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
     }()
 
     init(tileRect: CGRect, tileScale: Float, zoomLevel: UInt16,
@@ -83,6 +96,84 @@ class MapImage {
         return URL(fileURLWithPath: path)
     }
 
+    static func prefetchTiles(around coordinate: CLLocationCoordinate2D,
+                              source: String,
+                              zoomLevel: UInt16,
+                              radiusMeters: Double) async throws {
+        guard radiusMeters > 0 else { return }
+
+        let latDelta = radiusMeters / approximateMetersPerDegreeLatitude
+        let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
+        let lonDelta = min(
+            radiusMeters / (approximateMetersPerDegreeLatitude * cosLat),
+            maximumPrefetchLongitudeDeltaDegrees
+        )
+
+        let topLatitude = min(webMercatorMaxLatitude, coordinate.latitude + latDelta)
+        let bottomLatitude = max(-webMercatorMaxLatitude, coordinate.latitude - latDelta)
+        let leftLongitude = max(-180.0, coordinate.longitude - lonDelta)
+        let rightLongitude = min(180.0, coordinate.longitude + lonDelta)
+
+        let corners = [
+            CLLocationCoordinate2D(latitude: topLatitude, longitude: leftLongitude),
+            CLLocationCoordinate2D(latitude: topLatitude, longitude: rightLongitude),
+            CLLocationCoordinate2D(latitude: bottomLatitude, longitude: leftLongitude),
+            CLLocationCoordinate2D(latitude: bottomLatitude, longitude: rightLongitude)
+        ]
+
+        let points = corners.map { MapTile.coordinateToPoint($0, zoomLevel: zoomLevel) }
+        guard let minPointX = points.map(\.x).min(),
+              let maxPointX = points.map(\.x).max(),
+              let minPointY = points.map(\.y).min(),
+              let maxPointY = points.map(\.y).max() else { return }
+
+        let minX = Int(floor(minPointX))
+        let maxX = Int(floor(maxPointX))
+        let minY = Int(floor(minPointY))
+        let maxY = Int(floor(maxPointY))
+
+        let maxTileIndex = Int(pow(2.0, Double(zoomLevel))) - 1
+        let wrappedRange = maxTileIndex + 1
+        let clampedMinY = max(0, minY)
+        let clampedMaxY = min(maxTileIndex, maxY)
+        guard clampedMinY <= clampedMaxY else { return }
+        let estimatedTileCount = max(0, (maxX - minX + 1) * (clampedMaxY - clampedMinY + 1))
+
+        var tiles: [MapTile] = []
+        tiles.reserveCapacity(estimatedTileCount)
+
+        for y in clampedMinY...clampedMaxY {
+            for x in minX...maxX {
+                let wrappedX = ((x % wrappedRange) + wrappedRange) % wrappedRange
+                tiles.append(MapTile(source: source, x: UInt(wrappedX), y: UInt(y), z: zoomLevel))
+            }
+        }
+
+        if tiles.count > maxPrefetchTileCount {
+            log.debug("Skipping prefetch because tile count is too large: \(tiles.count, privacy: .public)")
+            return
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for tile in tiles {
+                if !Self.shouldFetchTileFromNetwork(tile, skipCache: false) {
+                    continue
+                }
+
+                group.addTask {
+                    let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
+                    let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+                    let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
+                    if let mimeType, !validTileContentTypes.contains(mimeType) {
+                        throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
+                    }
+                    try Self.validateAndStoreTileData(data, for: tile)
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
     func fetchTilesWithSuccess(_ success: @escaping (URL) -> Void,
                                      failure: @escaping (Error) -> Void,
                                      skipCache: Bool) {
@@ -112,6 +203,10 @@ class MapImage {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for row in tiles {
                 for tile in row {
+                    if !Self.shouldFetchTileFromNetwork(tile, skipCache: skipCache) {
+                        continue
+                    }
+
                     group.addTask {
                         let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
                         let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
@@ -119,10 +214,7 @@ class MapImage {
                         if let mimeType, !validTileContentTypes.contains(mimeType) {
                             throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
                         }
-                        tile.imageData = data
-                        guard tile.newImageRef() != nil else {
-                            throw TileFetchError.undecodableImage(url: tile.url)
-                        }
+                        try Self.validateAndStoreTileData(data, for: tile)
                     }
                 }
             }
@@ -144,6 +236,61 @@ class MapImage {
                          imageEffect.description,
                          zoomLevel)
         return key.md5Digest()
+    }
+
+    private static func cacheFileURL(for tile: MapTile) -> URL {
+        let cacheKey = "\(tile.source)_\(tile.z)_\(tile.x)_\(tile.y)".md5Digest()
+        return tileCacheDirectoryURL.appendingPathComponent("tile-\(cacheKey)")
+    }
+
+    private static func cachedTileData(for tile: MapTile) -> Data? {
+        let fileURL = cacheFileURL(for: tile)
+        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return nil }
+        return data
+    }
+
+    private static func loadCachedTileIfValid(for tile: MapTile) -> Bool {
+        guard let cachedData = cachedTileData(for: tile) else { return false }
+        guard MapTile.imageRef(from: cachedData) != nil else {
+            removeCachedTile(for: tile)
+            return false
+        }
+        tile.imageData = cachedData
+        return true
+    }
+
+    private static func shouldFetchTileFromNetwork(_ tile: MapTile, skipCache: Bool) -> Bool {
+        guard !skipCache else { return true }
+        return !loadCachedTileIfValid(for: tile)
+    }
+
+    private static func validateAndStoreTileData(_ data: Data, for tile: MapTile) throws {
+        tile.imageData = data
+        guard tile.newImageRef() != nil else {
+            throw TileFetchError.undecodableImage(url: tile.url)
+        }
+        storeTileData(data, for: tile)
+    }
+
+    private static func storeTileData(_ data: Data, for tile: MapTile) {
+        let fileURL = cacheFileURL(for: tile)
+        do {
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            log.error("Failed to write tile cache file: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private static func removeCachedTile(for tile: MapTile) {
+        let fileURL = cacheFileURL(for: tile)
+        do {
+            try FileManager.default.removeItem(at: fileURL)
+        } catch {
+            if let cocoaError = error as? CocoaError, cocoaError.code == .fileNoSuchFile {
+                return
+            }
+            log.error("Failed to remove tile cache file: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     private func writeImageData() -> URL {
