@@ -1,6 +1,8 @@
-import Cocoa
+import CoreGraphics
 import CoreImage
 import CoreLocation
+import Foundation
+import ImageIO
 import os
 
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
@@ -10,8 +12,10 @@ private let approximateMetersPerDegreeLatitude = 111_320.0
 private let minimumPrefetchLatitudeCosine = 0.2
 private let maximumPrefetchLongitudeDeltaDegrees = 10.0
 private let webMercatorMaxLatitude = 85.0511
-// Caps prefetch scope so one update doesn't enqueue excessive downloads.
 private let maxPrefetchTileCount = 2500
+// Leaves room on the shared session's four connections per host for a render
+// that starts while a prefetch is still running.
+private let maxConcurrentPrefetchDownloads = 2
 
 enum TileFetchError: LocalizedError {
     case invalidContentType(url: URL, contentType: String?)
@@ -27,17 +31,70 @@ enum TileFetchError: LocalizedError {
     }
 }
 
-class MapImage {
+/// A CIFilter chain read from `Defaults.plist`, as a value type so it can be
+/// handed to the off-main-actor renderer.
+struct ImageEffect: Sendable, Hashable {
+    struct Parameter: Sendable, Hashable {
+        let name: String
+        let value: Double
+    }
+
+    struct Filter: Sendable, Hashable {
+        let name: String
+        let parameters: [Parameter]
+    }
+
+    let id: String
+    let filters: [Filter]
+
+    init(id: String = "", filters: [Filter] = []) {
+        self.id = id
+        self.filters = filters
+    }
+
+    init(dictionary: NSDictionary) {
+        self.id = dictionary["id"] as? String ?? ""
+        let filterDefs = dictionary["filters"] as? [[String: Any]] ?? []
+        self.filters = filterDefs.compactMap { filterDef in
+            guard let name = filterDef["name"] as? String else { return nil }
+            let paramDefs = filterDef["parameters"] as? [[String: Any]] ?? []
+            let parameters = paramDefs.compactMap { param -> Parameter? in
+                guard let paramName = param["name"] as? String,
+                      let value = (param["value"] as? NSNumber)?.doubleValue else { return nil }
+                return Parameter(name: paramName, value: value)
+            }
+            return Filter(name: name, parameters: parameters)
+        }
+    }
+
+    /// Stable textual form used in the cache filename hash. Unlike
+    /// `NSDictionary.description` the ordering here is defined, so the same
+    /// effect always hashes to the same file.
+    var cacheDescription: String {
+        let described = filters.map { filter in
+            let params = filter.parameters.map { "\($0.name)=\($0.value)" }.joined(separator: ",")
+            return "\(filter.name)(\(params))"
+        }
+        return "\(id)[\(described.joined(separator: ";"))]"
+    }
+}
+
+/// Fetches the tiles for a map view and composites them into a single image on
+/// disk. A `Sendable` value type: the main actor builds one, then awaits
+/// `fetchTiles(skipCache:)`, which does its network and CoreGraphics work off
+/// the main actor.
+struct MapImage: Sendable {
     private let tileRect: CGRect
     private let tileScale: Float
     private let displayScale: Float
     private let zoomLevel: UInt16
     private let source: String
-    private let imageEffect: NSDictionary
+    private let imageEffect: ImageEffect
     private let tiles: [[MapTile]]
     private let pixelShift: CGPoint
-    private let logoImage: NSImage?
+    private let logoData: Data?
     private let tileSize: UInt
+    private let cachesTiles: Bool
 
     private static let sharedTileSession: URLSession = {
         let config = URLSessionConfiguration.default
@@ -45,23 +102,18 @@ class MapImage {
         return URLSession(configuration: config)
     }()
 
-    private static let tileCacheDirectoryURL: URL = {
-        let directory = URL(fileURLWithPath: FileManager.default.pathForPrivateFile("tiles"), isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
-    }()
-
     init(tileRect: CGRect, tileScale: Float, zoomLevel: UInt16,
-               source: String, effect: NSDictionary, logo: NSImage?,
-               displayScale: Float? = nil) {
+         source: String, effect: ImageEffect, logoData: Data?,
+         displayScale: Float? = nil, cachesTiles: Bool = false) {
         self.tileRect = tileRect
         self.tileScale = tileScale
         self.displayScale = displayScale ?? tileScale
         self.zoomLevel = zoomLevel
         self.source = source
         self.imageEffect = effect
-        self.logoImage = logo
+        self.logoData = logoData
         self.tileSize = UInt(256 * tileScale)
+        self.cachesTiles = cachesTiles
 
         var dummy: Float = 0
         let shiftX = Int(floor(modff(Float(tileRect.origin.x), &dummy) * Float(self.tileSize)))
@@ -96,97 +148,11 @@ class MapImage {
         return URL(fileURLWithPath: path)
     }
 
-    static func prefetchTiles(around coordinate: CLLocationCoordinate2D,
-                              source: String,
-                              zoomLevel: UInt16,
-                              radiusMeters: Double) async throws {
-        guard radiusMeters > 0 else { return }
-
-        let latDelta = radiusMeters / approximateMetersPerDegreeLatitude
-        let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
-        let lonDelta = min(
-            radiusMeters / (approximateMetersPerDegreeLatitude * cosLat),
-            maximumPrefetchLongitudeDeltaDegrees
-        )
-
-        let topLatitude = min(webMercatorMaxLatitude, coordinate.latitude + latDelta)
-        let bottomLatitude = max(-webMercatorMaxLatitude, coordinate.latitude - latDelta)
-        let leftLongitude = max(-180.0, coordinate.longitude - lonDelta)
-        let rightLongitude = min(180.0, coordinate.longitude + lonDelta)
-
-        let corners = [
-            CLLocationCoordinate2D(latitude: topLatitude, longitude: leftLongitude),
-            CLLocationCoordinate2D(latitude: topLatitude, longitude: rightLongitude),
-            CLLocationCoordinate2D(latitude: bottomLatitude, longitude: leftLongitude),
-            CLLocationCoordinate2D(latitude: bottomLatitude, longitude: rightLongitude)
-        ]
-
-        let points = corners.map { MapTile.coordinateToPoint($0, zoomLevel: zoomLevel) }
-        guard let minPointX = points.map(\.x).min(),
-              let maxPointX = points.map(\.x).max(),
-              let minPointY = points.map(\.y).min(),
-              let maxPointY = points.map(\.y).max() else { return }
-
-        let minX = Int(floor(minPointX))
-        let maxX = Int(floor(maxPointX))
-        let minY = Int(floor(minPointY))
-        let maxY = Int(floor(maxPointY))
-
-        let maxTileIndex = Int(pow(2.0, Double(zoomLevel))) - 1
-        let wrappedRange = maxTileIndex + 1
-        let clampedMinY = max(0, minY)
-        let clampedMaxY = min(maxTileIndex, maxY)
-        guard clampedMinY <= clampedMaxY else { return }
-        let estimatedTileCount = max(0, (maxX - minX + 1) * (clampedMaxY - clampedMinY + 1))
-
-        var tiles: [MapTile] = []
-        tiles.reserveCapacity(estimatedTileCount)
-
-        for y in clampedMinY...clampedMaxY {
-            for x in minX...maxX {
-                let wrappedX = ((x % wrappedRange) + wrappedRange) % wrappedRange
-                tiles.append(MapTile(source: source, x: UInt(wrappedX), y: UInt(y), z: zoomLevel))
-            }
-        }
-
-        if tiles.count > maxPrefetchTileCount {
-            log.debug("Skipping prefetch because tile count is too large: \(tiles.count, privacy: .public)")
-            return
-        }
-
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for tile in tiles {
-                if !Self.shouldFetchTileFromNetwork(tile, skipCache: false) {
-                    continue
-                }
-
-                group.addTask {
-                    let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
-                    let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
-                    let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
-                    if let mimeType, !validTileContentTypes.contains(mimeType) {
-                        throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
-                    }
-                    try Self.validateAndStoreTileData(data, for: tile)
-                }
-            }
-            try await group.waitForAll()
-        }
-    }
-
-    func fetchTilesWithSuccess(_ success: @escaping (URL) -> Void,
-                                     failure: @escaping (Error) -> Void,
-                                     skipCache: Bool) {
-        Task.detached { [self] in
-            do {
-                let url = try await self.fetchTiles(skipCache: skipCache)
-                success(url)
-            } catch {
-                failure(error)
-            }
-        }
-    }
-
+    /// Fetches every tile and composites the finished wallpaper to disk,
+    /// returning its location. Explicitly `@concurrent` so the tile decoding and
+    /// CoreGraphics compositing never run on the main actor, whatever the
+    /// caller's isolation.
+    @concurrent
     func fetchTiles(skipCache: Bool) async throws -> URL {
         let fileURL = self.fileURL
 
@@ -200,31 +166,133 @@ class MapImage {
 
         log.debug("Not found or skipping cache, fetching: \(fileURL.path, privacy: .public)")
 
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for row in tiles {
-                for tile in row {
-                    if !Self.shouldFetchTileFromNetwork(tile, skipCache: skipCache) {
-                        continue
-                    }
+        var images: [[CGImage?]] = tiles.map { Array(repeating: nil, count: $0.count) }
 
-                    group.addTask {
-                        let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
-                        let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
-                        let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
-                        if let mimeType, !validTileContentTypes.contains(mimeType) {
-                            throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
+        try await withThrowingTaskGroup(of: (row: Int, column: Int, image: CGImage).self) { group in
+            for (rowIndex, row) in tiles.enumerated() {
+                for (columnIndex, tile) in row.enumerated() {
+                    group.addTask { [cachesTiles] in
+                        if cachesTiles, !skipCache, let cached = TileCache.image(for: tile) {
+                            return (rowIndex, columnIndex, cached)
                         }
-                        try Self.validateAndStoreTileData(data, for: tile)
+                        let (data, image) = try await Self.download(tile)
+                        if cachesTiles {
+                            TileCache.store(data, for: tile)
+                        }
+                        return (rowIndex, columnIndex, image)
                     }
                 }
             }
-            try await group.waitForAll()
+
+            for try await result in group {
+                images[result.row][result.column] = result.image
+            }
         }
 
-        return writeImageData()
+        return writeImageData(tileImages: images)
+    }
+
+    /// Downloads the tiles within `radiusMeters` of `coordinate` that aren't
+    /// already in the tile cache. Best effort: a tile that fails is logged and
+    /// skipped. Returns false if any failed, so the caller can retry later.
+    @concurrent
+    static func prefetchTiles(around coordinate: CLLocationCoordinate2D,
+                              source: String,
+                              zoomLevel: UInt16,
+                              radiusMeters: Double) async -> Bool {
+        let tiles = prefetchTileList(around: coordinate, source: source,
+                                     zoomLevel: zoomLevel, radiusMeters: radiusMeters)
+            .filter { !TileCache.hasFreshTile($0) }
+
+        return await withTaskGroup(of: Bool.self) { group in
+            var allSucceeded = true
+            var pending = tiles.makeIterator()
+
+            func addNext() -> Bool {
+                guard let tile = pending.next() else { return false }
+                group.addTask {
+                    do {
+                        let (data, _) = try await download(tile)
+                        TileCache.store(data, for: tile)
+                        return true
+                    } catch {
+                        if !(error is CancellationError) {
+                            log.error("Error pre-fetching tile: \(error.localizedDescription, privacy: .public)")
+                        }
+                        return false
+                    }
+                }
+                return true
+            }
+
+            for _ in 0..<maxConcurrentPrefetchDownloads {
+                guard addNext() else { break }
+            }
+            for await succeeded in group {
+                allSucceeded = allSucceeded && succeeded
+                if !Task.isCancelled { _ = addNext() }
+            }
+            return allSucceeded && !Task.isCancelled
+        }
+    }
+
+    /// The tiles covering a square of side `2 * radiusMeters` around
+    /// `coordinate`, nearest first and capped at `maxPrefetchTileCount`.
+    static func prefetchTileList(around coordinate: CLLocationCoordinate2D,
+                                 source: String,
+                                 zoomLevel: UInt16,
+                                 radiusMeters: Double) -> [MapTile] {
+        guard radiusMeters > 0 else { return [] }
+
+        let latDelta = radiusMeters / approximateMetersPerDegreeLatitude
+        let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
+        let lonDelta = min(
+            radiusMeters / (approximateMetersPerDegreeLatitude * cosLat),
+            maximumPrefetchLongitudeDeltaDegrees
+        )
+
+        let topLeft = MapTile.coordinateToPoint(CLLocationCoordinate2D(
+            latitude: min(webMercatorMaxLatitude, coordinate.latitude + latDelta),
+            longitude: max(-180.0, coordinate.longitude - lonDelta)), zoomLevel: zoomLevel)
+        let bottomRight = MapTile.coordinateToPoint(CLLocationCoordinate2D(
+            latitude: max(-webMercatorMaxLatitude, coordinate.latitude - latDelta),
+            longitude: min(180.0, coordinate.longitude + lonDelta)), zoomLevel: zoomLevel)
+        let center = MapTile.coordinateToPoint(coordinate, zoomLevel: zoomLevel)
+
+        let maxTileIndex = Int(pow(2.0, Double(zoomLevel))) - 1
+        let minX = max(0, Int(floor(topLeft.x)))
+        let maxX = min(maxTileIndex, Int(floor(bottomRight.x)))
+        let minY = max(0, Int(floor(topLeft.y)))
+        let maxY = min(maxTileIndex, Int(floor(bottomRight.y)))
+        guard minX <= maxX, minY <= maxY else { return [] }
+
+        var tiles: [(tile: MapTile, distance: Double)] = []
+        tiles.reserveCapacity((maxX - minX + 1) * (maxY - minY + 1))
+        for y in minY...maxY {
+            for x in minX...maxX {
+                let dx = Double(x) + 0.5 - center.x
+                let dy = Double(y) + 0.5 - center.y
+                tiles.append((MapTile(source: source, x: UInt(x), y: UInt(y), z: zoomLevel), dx * dx + dy * dy))
+            }
+        }
+        tiles.sort { $0.distance < $1.distance }
+        return tiles.prefix(maxPrefetchTileCount).map(\.tile)
     }
 
     // MARK: - Private
+
+    private static func download(_ tile: MapTile) async throws -> (data: Data, image: CGImage) {
+        let (data, response) = try await sharedTileSession.data(for: tile.urlRequest)
+        let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+        let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
+        if let mimeType, !validTileContentTypes.contains(mimeType) {
+            throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
+        }
+        guard let image = MapTile.image(from: data) else {
+            throw TileFetchError.undecodableImage(url: tile.url)
+        }
+        return (data, image)
+    }
 
     private var uniqueHash: String {
         let key = String(format: "%@_%.1f_%.1f_%.2f_%.2f_%.2f_%.2f_%@_%u",
@@ -233,67 +301,12 @@ class MapImage {
                          tileRect.size.width, tileRect.size.height,
                          tileScale,
                          displayScale,
-                         imageEffect.description,
+                         imageEffect.cacheDescription,
                          zoomLevel)
         return key.md5Digest()
     }
 
-    private static func cacheFileURL(for tile: MapTile) -> URL {
-        let cacheKey = "\(tile.source)_\(tile.z)_\(tile.x)_\(tile.y)".md5Digest()
-        return tileCacheDirectoryURL.appendingPathComponent("tile-\(cacheKey)")
-    }
-
-    private static func cachedTileData(for tile: MapTile) -> Data? {
-        let fileURL = cacheFileURL(for: tile)
-        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return nil }
-        return data
-    }
-
-    private static func loadCachedTileIfValid(for tile: MapTile) -> Bool {
-        guard let cachedData = cachedTileData(for: tile) else { return false }
-        guard MapTile.imageRef(from: cachedData) != nil else {
-            removeCachedTile(for: tile)
-            return false
-        }
-        tile.imageData = cachedData
-        return true
-    }
-
-    private static func shouldFetchTileFromNetwork(_ tile: MapTile, skipCache: Bool) -> Bool {
-        guard !skipCache else { return true }
-        return !loadCachedTileIfValid(for: tile)
-    }
-
-    private static func validateAndStoreTileData(_ data: Data, for tile: MapTile) throws {
-        tile.imageData = data
-        guard tile.newImageRef() != nil else {
-            throw TileFetchError.undecodableImage(url: tile.url)
-        }
-        storeTileData(data, for: tile)
-    }
-
-    private static func storeTileData(_ data: Data, for tile: MapTile) {
-        let fileURL = cacheFileURL(for: tile)
-        do {
-            try data.write(to: fileURL, options: .atomic)
-        } catch {
-            log.error("Failed to write tile cache file: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
-    private static func removeCachedTile(for tile: MapTile) {
-        let fileURL = cacheFileURL(for: tile)
-        do {
-            try FileManager.default.removeItem(at: fileURL)
-        } catch {
-            if let cocoaError = error as? CocoaError, cocoaError.code == .fileNoSuchFile {
-                return
-            }
-            log.error("Failed to remove tile cache file: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
-    private func writeImageData() -> URL {
+    private func writeImageData(tileImages: [[CGImage?]]) -> URL {
         let width = Int(floor(tileRect.size.width * CGFloat(tileSize)))
         let height = Int(floor(tileRect.size.height * CGFloat(tileSize)))
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -311,9 +324,9 @@ class MapImage {
         }
 
         // Draw tiles
-        for (rowIndex, row) in tiles.enumerated() {
-            for (tileIndex, tile) in row.enumerated() {
-                if let tileImage = tile.newImageRef() {
+        for (rowIndex, row) in tileImages.enumerated() {
+            for (tileIndex, tileImage) in row.enumerated() {
+                if let tileImage {
                     let drawX = CGFloat(tileIndex) * CGFloat(tileSize) - pixelShift.x
                     let drawY = CGFloat(rowIndex) * CGFloat(tileSize) - pixelShift.y
                     context.draw(tileImage, in: CGRect(x: drawX, y: drawY,
@@ -342,23 +355,17 @@ class MapImage {
         }
 
         // Apply effect filters
-        if let filters = imageEffect["filters"] as? [[String: Any]] {
-            for filterDef in filters {
-                guard let name = filterDef["name"] as? String,
-                      let imageFilter = CIFilter(name: name) else { continue }
-                imageFilter.setDefaults()
-                imageFilter.setValue(ciOutput, forKey: kCIInputImageKey)
+        for filter in imageEffect.filters {
+            guard let imageFilter = CIFilter(name: filter.name) else { continue }
+            imageFilter.setDefaults()
+            imageFilter.setValue(ciOutput, forKey: kCIInputImageKey)
 
-                if let parameters = filterDef["parameters"] as? [[String: Any]] {
-                    for param in parameters {
-                        guard let paramName = param["name"] as? String else { continue }
-                        let value = scaledFilterValue(param["value"] as Any, key: paramName)
-                        imageFilter.setValue(value, forKey: paramName)
-                    }
-                }
-                if let output = imageFilter.outputImage {
-                    ciOutput = output
-                }
+            for parameter in filter.parameters {
+                let value = scaledFilterValue(parameter.value, key: parameter.name)
+                imageFilter.setValue(value, forKey: parameter.name)
+            }
+            if let output = imageFilter.outputImage {
+                ciOutput = output
             }
         }
 
@@ -368,8 +375,8 @@ class MapImage {
         }
 
         // Draw logo
-        if let logo = logoImage, let tiffData = logo.tiffRepresentation,
-           let imageSource = CGImageSourceCreateWithData(tiffData as CFData, nil),
+        if let logoData,
+           let imageSource = CGImageSourceCreateWithData(logoData as CFData, nil),
            let logoRef = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) {
             let margin: CGFloat = 10
             let logoWidth = CGFloat(logoRef.width)
@@ -398,11 +405,10 @@ class MapImage {
         return outputURL
     }
 
-    private func scaledFilterValue(_ value: Any, key: String) -> Any {
-        if [kCIInputRadiusKey, kCIInputScaleKey, kCIInputWidthKey].contains(key),
-           let number = value as? NSNumber {
-            return NSNumber(value: number.floatValue * displayScale)
+    private func scaledFilterValue(_ value: Double, key: String) -> NSNumber {
+        if [kCIInputRadiusKey, kCIInputScaleKey, kCIInputWidthKey].contains(key) {
+            return NSNumber(value: Float(value) * displayScale)
         }
-        return value
+        return NSNumber(value: value)
     }
 }
