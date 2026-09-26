@@ -10,6 +10,8 @@ struct PreferencesView: View {
     @AppStorage("useCurrentLocation") private var useCurrentLocation = true
     @AppStorage("randomLocationCategory") private var randomLocationCategory = ""
     @AppStorage("rotationIntervalSeconds") private var rotationIntervalSeconds = 86400
+    @AppStorage("prefetchCacheEnabled") private var prefetchCacheEnabled = false
+    @AppStorage("prefetchRadiusMeters") private var prefetchRadiusMeters = 1000
     @State private var startAtLogin = LoginItemManager.launchAtLogin
     @State private var manageStylesController: ManageMapStylesWindowController?
     // Loaded eagerly, not in onAppear: this view's body is built as soon as the
@@ -101,6 +103,19 @@ struct PreferencesView: View {
                     Text("\(level)").tag(level)
                 }
             }
+
+            Toggle("Pre-fetch nearby imagery", isOn: $prefetchCacheEnabled)
+                .disabled(!useCurrentLocation)
+
+            Picker("Pre-fetch radius:", selection: $prefetchRadiusMeters) {
+                Text("250 m").tag(250)
+                Text("500 m").tag(500)
+                Text("1 km").tag(1000)
+                Text("2 km").tag(2000)
+                Text("5 km").tag(5000)
+                Text("10 km").tag(10000)
+            }
+            .disabled(!useCurrentLocation || !prefetchCacheEnabled)
 
             Picker("Image Effect:", selection: $selectedImageEffectId) {
                 ForEach(imageEffects, id: \.effectId) { effect in

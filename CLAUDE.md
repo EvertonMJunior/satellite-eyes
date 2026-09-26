@@ -44,11 +44,13 @@ start the updater and set the wallpaper.
 | `MapManager.swift` | Core orchestrator: location tracking (CLLocationManager), network monitoring (NWPathMonitor), preference observation (KVO on UserDefaults), wallpaper setting. `@MainActor`; updates are chained onto `updateTask` so they run one at a time |
 | `MapImage.swift` | Sendable value type. Fetches tile grid using async/await TaskGroup, composites into single image with CGContext, applies CIFilter chains, writes to disk. `fetchTiles` is `@concurrent`, so this work never lands on the main actor. Also defines `ImageEffect`, the value-type form of a `Defaults.plist` filter chain |
 | `MapTile.swift` | Models a single tile (a value type): URL construction from templates (`{x}`, `{y}`, `{z}`, `{q}` placeholders), coordinate math (Web Mercator projection) |
+| `TileCache.swift` | On-disk cache of individual tiles under `tiles/` in the app's data directory, filled by the opt-in "Pre-fetch nearby imagery" preference. Entries expire after 30 days; `prune()` also caps the count |
 | `LocationStore.swift` | Loads bundled `Locations.plist` into `NamedLocation` values; supplies random locations by category |
 | `StatusItemController.swift` | Menu bar icon with animation frames, dropdown menu, observes MapManager notifications for state |
 | `PreferencesWindowController.swift` | SwiftUI preferences window (map style, zoom, effects, launch at login) |
 | `ManageMapStylesWindowController.swift` | SwiftUI window for adding/removing custom map tile sources |
 | `LoginItemManager.swift` | Launch at login via SMAppService |
+| `SatelliteEyesTests/PrefetchTileListTests.swift` | Which tiles a prefetch selects: nearest first, capped, clamped to the grid |
 | `SatelliteEyesTests/MapTileTests.swift` | Swift Testing suite for the Web Mercator projection: expected values come from the equivalent `asinh(tan(φ))` form of the maths, so an error in one arrangement does not hide in the other |
 
 ### Communication Patterns

@@ -1,5 +1,6 @@
 import CoreGraphics
 import CoreImage
+import CoreLocation
 import Foundation
 import ImageIO
 import os
@@ -7,6 +8,14 @@ import os
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapImage")
 
 private let validTileContentTypes: Set<String> = ["image/jpeg", "image/png"]
+private let approximateMetersPerDegreeLatitude = 111_320.0
+private let minimumPrefetchLatitudeCosine = 0.2
+private let maximumPrefetchLongitudeDeltaDegrees = 10.0
+private let webMercatorMaxLatitude = 85.0511
+private let maxPrefetchTileCount = 2500
+// Leaves room on the shared session's four connections per host for a render
+// that starts while a prefetch is still running.
+private let maxConcurrentPrefetchDownloads = 2
 
 enum TileFetchError: LocalizedError {
     case invalidContentType(url: URL, contentType: String?)
@@ -85,6 +94,7 @@ struct MapImage: Sendable {
     private let pixelShift: CGPoint
     private let logoData: Data?
     private let tileSize: UInt
+    private let cachesTiles: Bool
 
     private static let sharedTileSession: URLSession = {
         let config = URLSessionConfiguration.default
@@ -94,7 +104,7 @@ struct MapImage: Sendable {
 
     init(tileRect: CGRect, tileScale: Float, zoomLevel: UInt16,
          source: String, effect: ImageEffect, logoData: Data?,
-         displayScale: Float? = nil) {
+         displayScale: Float? = nil, cachesTiles: Bool = false) {
         self.tileRect = tileRect
         self.tileScale = tileScale
         self.displayScale = displayScale ?? tileScale
@@ -103,6 +113,7 @@ struct MapImage: Sendable {
         self.imageEffect = effect
         self.logoData = logoData
         self.tileSize = UInt(256 * tileScale)
+        self.cachesTiles = cachesTiles
 
         var dummy: Float = 0
         let shiftX = Int(floor(modff(Float(tileRect.origin.x), &dummy) * Float(self.tileSize)))
@@ -160,15 +171,13 @@ struct MapImage: Sendable {
         try await withThrowingTaskGroup(of: (row: Int, column: Int, image: CGImage).self) { group in
             for (rowIndex, row) in tiles.enumerated() {
                 for (columnIndex, tile) in row.enumerated() {
-                    group.addTask {
-                        let (data, response) = try await Self.sharedTileSession.data(for: tile.urlRequest)
-                        let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
-                        let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
-                        if let mimeType, !validTileContentTypes.contains(mimeType) {
-                            throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
+                    group.addTask { [cachesTiles] in
+                        if cachesTiles, !skipCache, let cached = TileCache.image(for: tile) {
+                            return (rowIndex, columnIndex, cached)
                         }
-                        guard let image = MapTile.image(from: data) else {
-                            throw TileFetchError.undecodableImage(url: tile.url)
+                        let (data, image) = try await Self.download(tile)
+                        if cachesTiles {
+                            TileCache.store(data, for: tile)
                         }
                         return (rowIndex, columnIndex, image)
                     }
@@ -183,7 +192,107 @@ struct MapImage: Sendable {
         return writeImageData(tileImages: images)
     }
 
+    /// Downloads the tiles within `radiusMeters` of `coordinate` that aren't
+    /// already in the tile cache. Best effort: a tile that fails is logged and
+    /// skipped. Returns false if any failed, so the caller can retry later.
+    @concurrent
+    static func prefetchTiles(around coordinate: CLLocationCoordinate2D,
+                              source: String,
+                              zoomLevel: UInt16,
+                              radiusMeters: Double) async -> Bool {
+        let tiles = prefetchTileList(around: coordinate, source: source,
+                                     zoomLevel: zoomLevel, radiusMeters: radiusMeters)
+            .filter { !TileCache.hasFreshTile($0) }
+
+        return await withTaskGroup(of: Bool.self) { group in
+            var allSucceeded = true
+            var pending = tiles.makeIterator()
+
+            func addNext() -> Bool {
+                guard let tile = pending.next() else { return false }
+                group.addTask {
+                    do {
+                        let (data, _) = try await download(tile)
+                        TileCache.store(data, for: tile)
+                        return true
+                    } catch {
+                        if !(error is CancellationError), (error as? URLError)?.code != .cancelled {
+                            log.error("Error pre-fetching tile: \(error.localizedDescription, privacy: .public)")
+                        }
+                        return false
+                    }
+                }
+                return true
+            }
+
+            for _ in 0..<maxConcurrentPrefetchDownloads {
+                guard addNext() else { break }
+            }
+            for await succeeded in group {
+                allSucceeded = allSucceeded && succeeded
+                if !Task.isCancelled { _ = addNext() }
+            }
+            return allSucceeded && !Task.isCancelled
+        }
+    }
+
+    /// The tiles covering a square of side `2 * radiusMeters` around
+    /// `coordinate`, nearest first and capped at `maxPrefetchTileCount`.
+    static func prefetchTileList(around coordinate: CLLocationCoordinate2D,
+                                 source: String,
+                                 zoomLevel: UInt16,
+                                 radiusMeters: Double) -> [MapTile] {
+        guard radiusMeters > 0 else { return [] }
+
+        let latDelta = radiusMeters / approximateMetersPerDegreeLatitude
+        let cosLat = max(minimumPrefetchLatitudeCosine, abs(cos(coordinate.latitude * .pi / 180.0)))
+        let lonDelta = min(
+            radiusMeters / (approximateMetersPerDegreeLatitude * cosLat),
+            maximumPrefetchLongitudeDeltaDegrees
+        )
+
+        let topLeft = MapTile.coordinateToPoint(CLLocationCoordinate2D(
+            latitude: min(webMercatorMaxLatitude, coordinate.latitude + latDelta),
+            longitude: max(-180.0, coordinate.longitude - lonDelta)), zoomLevel: zoomLevel)
+        let bottomRight = MapTile.coordinateToPoint(CLLocationCoordinate2D(
+            latitude: max(-webMercatorMaxLatitude, coordinate.latitude - latDelta),
+            longitude: min(180.0, coordinate.longitude + lonDelta)), zoomLevel: zoomLevel)
+        let center = MapTile.coordinateToPoint(coordinate, zoomLevel: zoomLevel)
+
+        let maxTileIndex = Int(pow(2.0, Double(zoomLevel))) - 1
+        let minX = max(0, Int(floor(topLeft.x)))
+        let maxX = min(maxTileIndex, Int(floor(bottomRight.x)))
+        let minY = max(0, Int(floor(topLeft.y)))
+        let maxY = min(maxTileIndex, Int(floor(bottomRight.y)))
+        guard minX <= maxX, minY <= maxY else { return [] }
+
+        var tiles: [(tile: MapTile, distance: Double)] = []
+        tiles.reserveCapacity((maxX - minX + 1) * (maxY - minY + 1))
+        for y in minY...maxY {
+            for x in minX...maxX {
+                let dx = Double(x) + 0.5 - center.x
+                let dy = Double(y) + 0.5 - center.y
+                tiles.append((MapTile(source: source, x: UInt(x), y: UInt(y), z: zoomLevel), dx * dx + dy * dy))
+            }
+        }
+        tiles.sort { $0.distance < $1.distance }
+        return tiles.prefix(maxPrefetchTileCount).map(\.tile)
+    }
+
     // MARK: - Private
+
+    private static func download(_ tile: MapTile) async throws -> (data: Data, image: CGImage) {
+        let (data, response) = try await sharedTileSession.data(for: tile.urlRequest)
+        let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
+        let mimeType = contentType.flatMap { $0.split(separator: ";").first.map(String.init) }
+        if let mimeType, !validTileContentTypes.contains(mimeType) {
+            throw TileFetchError.invalidContentType(url: tile.url, contentType: contentType)
+        }
+        guard let image = MapTile.image(from: data) else {
+            throw TileFetchError.undecodableImage(url: tile.url)
+        }
+        return (data, image)
+    }
 
     private var uniqueHash: String {
         let key = String(format: "%@_%.1f_%.1f_%.2f_%.2f_%.2f_%.2f_%@_%u",

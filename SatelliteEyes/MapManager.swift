@@ -5,6 +5,16 @@ import os
 
 private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "SatelliteEyes", category: "MapManager")
 private let baseTileSize: CGFloat = 256
+// 1/1000° is ~111 m of latitude, well inside the location manager's 300 m
+// distance filter, so prefetches for effectively the same spot are deduplicated.
+private let prefetchCoordinateRoundingPrecision = 1000.0
+
+/// A tile source and zoom level a screen renders with, and so the tiles worth
+/// prefetching for it.
+private struct PrefetchTarget: Hashable, Sendable {
+    let source: String
+    let zoomLevel: UInt16
+}
 
 // `CLLocationManagerDelegate` isn't main actor-isolated, but the location
 // manager is created here on the main actor and so calls back on it. The
@@ -38,6 +48,8 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
     /// change that has already been handled can be recognised and skipped.
     private var currentRandomLocationCategory: String?
     private var rotationTimer: Timer?
+    private var prefetchTask: Task<Void, Never>?
+    private var lastPrefetchKey: String?
 
     private var useCurrentLocation: Bool {
         UserDefaults.standard.bool(forKey: "useCurrentLocation")
@@ -49,6 +61,15 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
 
     private var rotationIntervalSeconds: TimeInterval {
         max(3600, TimeInterval(UserDefaults.standard.integer(forKey: "rotationIntervalSeconds")))
+    }
+
+    private var prefetchCacheEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "prefetchCacheEnabled")
+    }
+
+    private var prefetchRadiusMeters: Double {
+        let radius = UserDefaults.standard.integer(forKey: "prefetchRadiusMeters")
+        return Double(min(max(radius, 100), 20_000))
     }
 
     // MARK: - Init
@@ -79,6 +100,8 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
         UserDefaults.standard.addObserver(self, forKeyPath: "useCurrentLocation", options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: "randomLocationCategory", options: .new, context: nil)
         UserDefaults.standard.addObserver(self, forKeyPath: "rotationIntervalSeconds", options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: "prefetchCacheEnabled", options: .new, context: nil)
+        UserDefaults.standard.addObserver(self, forKeyPath: "prefetchRadiusMeters", options: .new, context: nil)
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(spaceChanged),
@@ -99,7 +122,10 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
         UserDefaults.standard.removeObserver(self, forKeyPath: "useCurrentLocation")
         UserDefaults.standard.removeObserver(self, forKeyPath: "randomLocationCategory")
         UserDefaults.standard.removeObserver(self, forKeyPath: "rotationIntervalSeconds")
+        UserDefaults.standard.removeObserver(self, forKeyPath: "prefetchCacheEnabled")
+        UserDefaults.standard.removeObserver(self, forKeyPath: "prefetchRadiusMeters")
         rotationTimer?.invalidate()
+        prefetchTask?.cancel()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
@@ -161,6 +187,8 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
                 log.error("Error fetching image: \(error.localizedDescription, privacy: .public)")
             }
         }
+
+        prefetchIfNeeded(around: coordinate)
     }
 
     private func makeMapImage(for screen: NSScreen, coordinate: CLLocationCoordinate2D) -> MapImage? {
@@ -193,7 +221,7 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
         return MapImage(
             tileRect: tileRect, tileScale: scale, zoomLevel: effectiveZoom,
             source: source(for: screen), effect: selectedImageEffect, logoData: logoData,
-            displayScale: displayScale)
+            displayScale: displayScale, cachesTiles: prefetchCacheEnabled)
     }
 
     private func setDesktopImage(_ filePath: URL, for screen: NSScreen, force: Bool) async {
@@ -234,6 +262,8 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
         for entry in filesAndDates.dropFirst(20) {
             try? FileManager.default.removeItem(atPath: entry.path)
         }
+
+        Task { await TileCache.prune() }
     }
 
     var browserURL: URL? {
@@ -322,6 +352,21 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
         case "rotationIntervalSeconds":
             if !useCurrentLocation {
                 scheduleRotationTimer()
+            }
+        case "prefetchCacheEnabled":
+            if prefetchCacheEnabled {
+                if let location = lastSeenLocation {
+                    prefetchIfNeeded(around: location.coordinate)
+                }
+            } else {
+                prefetchTask?.cancel()
+                prefetchTask = nil
+                lastPrefetchKey = nil
+                Task { await TileCache.removeAll() }
+            }
+        case "prefetchRadiusMeters":
+            if let location = lastSeenLocation {
+                prefetchIfNeeded(around: location.coordinate)
             }
         default:
             updateMap()
@@ -478,6 +523,42 @@ final class MapManager: NSObject, @preconcurrency CLLocationManagerDelegate {
             return 2
         }
         return 1
+    }
+
+    /// Starts downloading the tiles around `coordinate` for every screen's
+    /// source and zoom level, replacing any prefetch already running.
+    private func prefetchIfNeeded(around coordinate: CLLocationCoordinate2D) {
+        guard useCurrentLocation, prefetchCacheEnabled else { return }
+
+        let targets = Set(NSScreen.screens.map { screen in
+            PrefetchTarget(source: source(for: screen),
+                           zoomLevel: shouldUpscaleRetina(for: screen) ? zoomLevel + 1 : zoomLevel)
+        }).filter { !$0.source.isEmpty }
+        guard !targets.isEmpty else { return }
+
+        let radius = prefetchRadiusMeters
+        let latitude = (coordinate.latitude * prefetchCoordinateRoundingPrecision).rounded()
+        let longitude = (coordinate.longitude * prefetchCoordinateRoundingPrecision).rounded()
+        let targetKeys = targets.map { "\($0.source)@\($0.zoomLevel)" }.sorted().joined(separator: "|")
+        let key = "\(targetKeys)_\(Int(radius))_\(latitude)_\(longitude)"
+        guard key != lastPrefetchKey else { return }
+        lastPrefetchKey = key
+
+        prefetchTask?.cancel()
+        prefetchTask = Task { [weak self] in
+            var allSucceeded = true
+            for target in targets {
+                let succeeded = await MapImage.prefetchTiles(
+                    around: coordinate, source: target.source,
+                    zoomLevel: target.zoomLevel, radiusMeters: radius)
+                allSucceeded = allSucceeded && succeeded
+                if Task.isCancelled { return }
+            }
+            if !allSucceeded, self?.lastPrefetchKey == key {
+                self?.lastPrefetchKey = nil
+            }
+            await TileCache.prune()
+        }
     }
 
     private func shouldUpscaleRetina(for screen: NSScreen) -> Bool {
