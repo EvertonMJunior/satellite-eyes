@@ -216,7 +216,7 @@ struct MapImage: Sendable {
                         TileCache.store(data, for: tile)
                         return true
                     } catch {
-                        if !(error is CancellationError) {
+                        if !(error is CancellationError), (error as? URLError)?.code != .cancelled {
                             log.error("Error pre-fetching tile: \(error.localizedDescription, privacy: .public)")
                         }
                         return false
